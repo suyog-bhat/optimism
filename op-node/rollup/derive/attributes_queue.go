@@ -31,6 +31,8 @@ type AttributesWithParent struct {
 	Attributes   *eth.PayloadAttributes
 	Parent       eth.L2BlockRef
 	IsLastInSpan bool
+
+	// TODO register the L1Origin that the attributes were derived from
 }
 
 type AttributesQueue struct {

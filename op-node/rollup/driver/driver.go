@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"github.com/ethereum-optimism/optimism/op-node/rollup/attributes"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -9,7 +10,6 @@ import (
 
 	"github.com/ethereum-optimism/optimism/op-node/rollup"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/async"
-	"github.com/ethereum-optimism/optimism/op-node/rollup/attributes"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/clsync"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/conductor"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
@@ -60,7 +60,7 @@ type L2Chain interface {
 
 type DerivationPipeline interface {
 	Reset()
-	Step(ctx context.Context) error
+	Step(ctx context.Context) (*derive.AttributesWithParent, error)
 	Origin() eth.L1BlockRef
 	EngineReady() bool
 }
@@ -68,6 +68,11 @@ type DerivationPipeline interface {
 type CLSync interface {
 	LowestQueuedUnsafeBlock() eth.L2BlockRef
 	AddUnsafePayload(payload *eth.ExecutionPayloadEnvelope)
+	Proceed(ctx context.Context) error
+}
+
+type AttributesHandler interface {
+	SetAttributes(attributes *derive.AttributesWithParent)
 	Proceed(ctx context.Context) error
 }
 
@@ -168,8 +173,7 @@ func NewDriver(
 	}
 
 	attributesHandler := attributes.NewAttributesHandler(log, cfg, engine, l2)
-	derivationPipeline := derive.NewDerivationPipeline(log, cfg, verifConfDepth, l1Blobs, plasma, l2, engine,
-		metrics, syncCfg, safeHeadListener, finalizer, attributesHandler)
+	derivationPipeline := derive.NewDerivationPipeline(log, cfg, verifConfDepth, l1Blobs, plasma, l2, metrics)
 	attrBuilder := derive.NewFetchingAttributesBuilder(cfg, l1, l2)
 	meteredEngine := NewMeteredEngine(cfg, engine, metrics, log) // Only use the metered engine in the sequencer b/c it records sequencing metrics.
 	sequencer := NewSequencer(log, cfg, meteredEngine, attrBuilder, findL1Origin, metrics)
@@ -180,6 +184,8 @@ func NewDriver(
 		derivation:         derivationPipeline,
 		clSync:             clSync,
 		finalizer:          finalizer,
+		attributesHandler:  attributesHandler,
+		safeHeadNotifs:     safeHeadListener,
 		engineController:   engine,
 		stateReq:           make(chan chan struct{}),
 		forceReset:         make(chan chan struct{}, 10),

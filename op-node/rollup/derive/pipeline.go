@@ -2,7 +2,6 @@ package derive
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 
@@ -36,13 +35,7 @@ type ResettableStage interface {
 	Reset(ctx context.Context, base eth.L1BlockRef, baseCfg eth.SystemConfig) error
 }
 
-type EngineQueueStage interface {
-	Origin() eth.L1BlockRef
-	SystemConfig() eth.SystemConfig
-	Step(context.Context) error
-}
-
-// DerivationPipeline is updated with new L1 data, and the Step() function can be iterated on to keep the L2 Engine in sync.
+// DerivationPipeline is updated with new L1 data, and the Step() function can be iterated on to generate attributes
 type DerivationPipeline struct {
 	log       log.Logger
 	rollupCfg *rollup.Config
@@ -56,7 +49,11 @@ type DerivationPipeline struct {
 
 	// Special stages to keep track of
 	traversal *L1Traversal
-	eng       EngineQueueStage
+
+	attrib *AttributesQueue
+
+	// L1 block that the next returned attributes are derived from, i.e. at the L2-end of the pipeline.
+	origin eth.L1BlockRef
 
 	metrics Metrics
 }
@@ -64,8 +61,7 @@ type DerivationPipeline struct {
 // NewDerivationPipeline creates a derivation pipeline, which should be reset before use.
 
 func NewDerivationPipeline(log log.Logger, rollupCfg *rollup.Config, l1Fetcher L1Fetcher, l1Blobs L1BlobsFetcher,
-	plasma PlasmaInputFetcher, l2Source L2Source, engine LocalEngineControl, metrics Metrics,
-	syncCfg *sync.Config, safeHeadListener SafeHeadListener, finalizer FinalizerHooks, attributesHandler AttributesHandler) *DerivationPipeline {
+	plasma PlasmaInputFetcher, l2Source L2Source, metrics Metrics) *DerivationPipeline {
 
 	// Pull stages
 	l1Traversal := NewL1Traversal(log, rollupCfg, l1Fetcher)
@@ -78,14 +74,10 @@ func NewDerivationPipeline(log log.Logger, rollupCfg *rollup.Config, l1Fetcher L
 	attrBuilder := NewFetchingAttributesBuilder(rollupCfg, l1Fetcher, l2Source)
 	attributesQueue := NewAttributesQueue(log, rollupCfg, attrBuilder, batchQueue)
 
-	// Step stages
-	eng := NewEngineQueue(log, rollupCfg, l2Source, engine, metrics, attributesQueue,
-		l1Fetcher, syncCfg, safeHeadListener, finalizer, attributesHandler)
-
 	// Reset from engine queue then up from L1 Traversal. The stages do not talk to each other during
 	// the reset, but after the engine queue, this is the order in which the stages could talk to each other.
 	// Note: The engine queue stage is the only reset that can fail.
-	stages := []ResettableStage{eng, l1Traversal, l1Src, plasma, frameQueue, bank, chInReader, batchQueue, attributesQueue}
+	stages := []ResettableStage{l1Traversal, l1Src, plasma, frameQueue, bank, chInReader, batchQueue, attributesQueue}
 
 	return &DerivationPipeline{
 		log:       log,
@@ -94,7 +86,6 @@ func NewDerivationPipeline(log log.Logger, rollupCfg *rollup.Config, l1Fetcher L
 		plasma:    plasma,
 		resetting: 0,
 		stages:    stages,
-		eng:       eng,
 		metrics:   metrics,
 		traversal: l1Traversal,
 	}
@@ -106,14 +97,15 @@ func (dp *DerivationPipeline) EngineReady() bool {
 	return dp.resetting > 0
 }
 
-func (dp *DerivationPipeline) Reset() {
+func (dp *DerivationPipeline) Reset(origin eth.L1BlockRef) {
 	dp.resetting = 0
+	dp.origin = origin
 }
 
 // Origin is the L1 block of the inner-most stage of the derivation pipeline,
 // i.e. the L1 chain up to and including this point included and/or produced all the safe L2 blocks.
 func (dp *DerivationPipeline) Origin() eth.L1BlockRef {
-	return dp.eng.Origin()
+	return dp.origin
 }
 
 // Step tries to progress the buffer.
@@ -122,31 +114,130 @@ func (dp *DerivationPipeline) Origin() eth.L1BlockRef {
 // Any other error is critical and the derivation pipeline should be reset.
 // An error is expected when the underlying source closes.
 // When Step returns nil, it should be called again, to continue the derivation process.
-func (dp *DerivationPipeline) Step(ctx context.Context) error {
+func (dp *DerivationPipeline) Step(ctx context.Context, pendingSafeHead eth.L2BlockRef) (*AttributesWithParent, error) {
 	defer dp.metrics.RecordL1Ref("l1_derived", dp.Origin())
 
 	// if any stages need to be reset, do that first.
 	if dp.resetting < len(dp.stages) {
-		if err := dp.stages[dp.resetting].Reset(ctx, dp.eng.Origin(), dp.eng.SystemConfig()); err == io.EOF {
+
+		// TODO move reset behavior out of Step()
+		dp.reset(ctx)
+
+		// TODO take system config from reset work
+
+		if err := dp.stages[dp.resetting].Reset(ctx, dp.origin, dp.eng.SystemConfig()); err == io.EOF {
 			dp.log.Debug("reset of stage completed", "stage", dp.resetting, "origin", dp.eng.Origin())
 			dp.resetting += 1
-			return nil
+			return nil, nil
 		} else if err != nil {
-			return fmt.Errorf("stage %d failed resetting: %w", dp.resetting, err)
+			return nil, fmt.Errorf("stage %d failed resetting: %w", dp.resetting, err)
 		} else {
-			return nil
+			return nil, nil
 		}
 	}
 
-	// Now step the engine queue. It will pull earlier data as needed.
-	if err := dp.eng.Step(ctx); err == io.EOF {
-		// If every stage has returned io.EOF, try to advance the L1 Origin
-		return dp.traversal.AdvanceL1Block(ctx)
-	} else if errors.Is(err, EngineELSyncing) {
-		return err
-	} else if err != nil {
-		return fmt.Errorf("engine stage failed: %w", err)
-	} else {
-		return nil
+	prevOrigin := dp.origin
+	newOrigin := dp.attrib.Origin()
+	if prevOrigin != newOrigin {
+		// Check if the L2 unsafe head origin is consistent with the new origin
+		if err := VerifyNewL1Origin(ctx, prevOrigin, dp.l1Fetcher, newOrigin); err != nil {
+			return nil, fmt.Errorf("failed to verify L1 origin transition: %w", err)
+		}
+		dp.origin = newOrigin
 	}
+
+	if attrib, err := dp.attrib.NextAttributes(ctx, pendingSafeHead); err == nil {
+		return attrib, nil
+	} else if err == io.EOF {
+		// If every stage has returned io.EOF, try to advance the L1 Origin
+		return nil, dp.traversal.AdvanceL1Block(ctx)
+	} else {
+		return nil, fmt.Errorf("derivation failed: %w", err)
+	}
+}
+
+// Reset walks the L2 chain backwards until it finds an L2 block whose L1 origin is canonical.
+// The unsafe head is set to the head of the L2 chain, unless the existing safe head is not canonical.
+func (eq *DerivationPipeline) reset(ctx context.Context) error {
+	pipelineOrigin, err := ResetEngine(ctx)
+	// note: finalizedL1 and triedFinalizeAt do not reset, since these do not change between reorgs.
+	// note: we do not clear the unsafe payloads queue; if the payloads are not applicable anymore the parent hash checks will clear out the old payloads.
+	eq.origin = pipelineOrigin
+	if err := eq.safeHeadNotifs.SafeHeadReset(safe); err != nil {
+		return err
+	}
+	if eq.safeHeadNotifs.Enabled() && safe.Number == eq.cfg.Genesis.L2.Number && safe.Hash == eq.cfg.Genesis.L2.Hash {
+		// The rollup genesis block is always safe by definition. So if the pipeline resets this far back we know
+		// we will process all safe head updates and can record genesis as always safe from L1 genesis.
+		// Note that it is not safe to use cfg.Genesis.L1 here as it is the block immediately before the L2 genesis
+		// but the contracts may have been deployed earlier than that, allowing creating a dispute game
+		// with a L1 head prior to cfg.Genesis.L1
+		l1Genesis, err := eq.l1Fetcher.L1BlockRefByNumber(ctx, 0)
+		if err != nil {
+			return fmt.Errorf("failed to retrieve L1 genesis: %w", err)
+		}
+		if err := eq.safeHeadNotifs.SafeHeadUpdated(safe, l1Genesis.ID()); err != nil {
+			return err
+		}
+	}
+	return io.EOF
+}
+
+type ResetL2 interface {
+	sync.L2Chain
+	SystemConfigL2Fetcher
+}
+
+func ResetEngine(ctx context.Context, log log.Logger, cfg *rollup.Config, ec LocalEngineControl, l1 sync.L1Chain, l2 ResetL2, syncCfg *sync.Config) (eth.L1BlockRef, error) {
+	result, err := sync.FindL2Heads(ctx, cfg, l1, l2, log, syncCfg)
+	if err != nil {
+		return eth.L1BlockRef{}, NewTemporaryError(fmt.Errorf("failed to find the L2 Heads to start from: %w", err))
+	}
+	finalized, safe, unsafe := result.Finalized, result.Safe, result.Unsafe
+	l1Origin, err := l1.L1BlockRefByHash(ctx, safe.L1Origin.Hash)
+	if err != nil {
+		return eth.L1BlockRef{}, NewTemporaryError(fmt.Errorf("failed to fetch the new L1 progress: origin: %v; err: %w", safe.L1Origin, err))
+	}
+	if safe.Time < l1Origin.Time {
+		return eth.L1BlockRef{}, NewResetError(fmt.Errorf("cannot reset block derivation to start at L2 block %s with time %d older than its L1 origin %s with time %d, time invariant is broken",
+			safe, safe.Time, l1Origin, l1Origin.Time))
+	}
+
+	// Walk back L2 chain to find the L1 origin that is old enough to start buffering channel data from.
+	pipelineL2 := safe
+	for {
+		afterL2Genesis := pipelineL2.Number > cfg.Genesis.L2.Number
+		afterL1Genesis := pipelineL2.L1Origin.Number > cfg.Genesis.L1.Number
+		afterChannelTimeout := pipelineL2.L1Origin.Number+cfg.ChannelTimeout > l1Origin.Number
+		if afterL2Genesis && afterL1Genesis && afterChannelTimeout {
+			parent, err := l2.L2BlockRefByHash(ctx, pipelineL2.ParentHash)
+			if err != nil {
+				return eth.L1BlockRef{}, NewResetError(fmt.Errorf("failed to fetch L2 parent block %s", pipelineL2.ParentID()))
+			}
+			pipelineL2 = parent
+		} else {
+			break
+		}
+	}
+
+	sysCfg, err := l2.SystemConfigByL2Hash(ctx, pipelineL2.Hash)
+	if err != nil {
+		return eth.L1BlockRef{}, NewTemporaryError(fmt.Errorf("failed to fetch L1 config of L2 block %s: %w", pipelineL2.ID(), err))
+	}
+
+	pipelineOrigin, err := l1.L1BlockRefByHash(ctx, pipelineL2.L1Origin.Hash)
+	if err != nil {
+		return eth.L1BlockRef{}, NewTemporaryError(fmt.Errorf("failed to fetch the new L1 progress: origin: %s; err: %w", pipelineL2.L1Origin, err))
+	}
+	log.Debug("Reset engine queue", "safeHead", safe, "unsafe", unsafe, "safe_timestamp", safe.Time, "unsafe_timestamp", unsafe.Time, "l1Origin", l1Origin)
+	ec.SetUnsafeHead(unsafe)
+	ec.SetSafeHead(safe)
+	ec.SetPendingSafeL2Head(safe)
+	ec.SetFinalizedHead(finalized)
+	ec.SetBackupUnsafeL2Head(eth.L2BlockRef{}, false)
+	ec.ResetBuildingState()
+
+	// TODO: maybe store pipelineOrigin in engine-controller instead?
+
+	return pipelineOrigin, nil
 }

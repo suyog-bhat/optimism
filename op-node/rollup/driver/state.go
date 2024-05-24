@@ -42,6 +42,11 @@ type Driver struct {
 
 	finalizer Finalizer
 
+	attributesHandler AttributesHandler
+
+	safeHeadNotifs       derive.SafeHeadListener // notified when safe head is updated
+	lastNotifiedSafeHead eth.L2BlockRef
+
 	clSync CLSync
 
 	// The engine controller is used by the sequencer & derivation components.
@@ -378,6 +383,7 @@ func (s *Driver) eventLoop() {
 				// If the pipeline corrupts, e.g. due to a reorg, simply reset it
 				s.log.Warn("Derivation pipeline is reset", "err", err)
 				s.derivation.Reset()
+				s.finalizer.Reset()
 				s.metrics.RecordPipelineReset()
 				continue
 			} else if err != nil && errors.Is(err, derive.ErrTemporary) {
@@ -445,6 +451,7 @@ func (s *Driver) eventLoop() {
 	}
 }
 
+// TODO: this should change to be event based, decoupled
 func (s *Driver) syncStep(ctx context.Context) error {
 	// If we don't need to call FCU to restore unsafeHead using backupUnsafe, keep going b/c
 	// this was a no-op(except correcting invalid state when backupUnsafe is empty but TryBackupUnsafeReorg called).
@@ -457,14 +464,49 @@ func (s *Driver) syncStep(ctx context.Context) error {
 	if err := s.engineController.TryUpdateEngine(ctx); !errors.Is(err, derive.ErrNoFCUNeeded) {
 		return err
 	}
+
+	if s.engineController.IsEngineSyncing() {
+		// The pipeline cannot move forwards if doing EL sync.
+		return derive.EngineELSyncing
+	}
+
 	// Trying unsafe payload should be done before safe attributes
 	// It allows the unsafe head to move forward while the long-range consolidation is in progress.
 	if err := s.clSync.Proceed(ctx); err != io.EOF {
 		// EOF error means we can't process the next unsafe payload. Then we should process next safe attributes.
 		return err
 	}
+	// Try safe attributes now.
+	if err := s.attributesHandler.Proceed(ctx); err != io.EOF {
+		// EOF error means we can't process the next attributes. Then we should derive the next attributes.
+		return err
+	}
+	derivationOrigin := s.derivation.Origin()
+	if s.lastNotifiedSafeHead != s.engineController.SafeL2Head() {
+		s.lastNotifiedSafeHead = s.engineController.SafeL2Head()
+		// make sure we track the last L2 safe head for every new L1 block
+		if err := s.safeHeadNotifs.SafeHeadUpdated(s.lastNotifiedSafeHead, derivationOrigin.ID()); err != nil {
+			// At this point our state is in a potentially inconsistent state as we've updated the safe head
+			// in the execution client but failed to post process it. Reset the pipeline so the safe head rolls back
+			// a little (it always rolls back at least 1 block) and then it will retry storing the entry
+			return derive.NewResetError(fmt.Errorf("safe head notifications failed: %w", err))
+		}
+	}
+	s.finalizer.PostProcessSafeL2(s.engineController.SafeL2Head(), derivationOrigin)
+
+	// try to finalize the L2 blocks we have synced so far (no-op if L1 finality is behind)
+	if err := s.finalizer.OnDerivationL1End(ctx, derivationOrigin); err != nil {
+		return fmt.Errorf("finalizer OnDerivationL1End error: %w", err)
+	}
+
 	s.metrics.SetDerivationIdle(false)
-	return s.derivation.Step(s.driverCtx)
+	attr, err := s.derivation.Step(ctx)
+	if err != nil {
+		return err
+	}
+
+	s.attributesHandler.SetAttributes(attr)
+	return nil
 }
 
 // ResetDerivationPipeline forces a reset of the derivation pipeline.
