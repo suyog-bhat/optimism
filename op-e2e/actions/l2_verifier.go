@@ -69,7 +69,11 @@ func NewL2Verifier(t Testing, log log.Logger, l1 derive.L1Fetcher, eng L2API, cf
 	metrics := &testutils.TestDerivationMetrics{}
 	engine := derive.NewEngineController(eng, log, metrics, cfg, syncCfg.SyncMode)
 	blobsSrc := &EmptyBlobsSource{}
-	pipeline := derive.NewDerivationPipeline(log, cfg, l1, blobsSrc, eng, engine, metrics, syncCfg)
+	daConfig := rollup.DAConfig{
+		GcpProjectId:       "",
+		GcpAuthFileKeyPath: "",
+	}
+	pipeline := derive.NewDerivationPipeline(log, cfg, daConfig, l1, blobsSrc, eng, engine, metrics, syncCfg)
 	pipeline.Reset()
 
 	rollupNode := &L2Verifier{

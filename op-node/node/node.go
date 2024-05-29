@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ethereum-optimism/optimism/op-node/rollup"
 	"sync/atomic"
 	"time"
 
@@ -42,15 +43,15 @@ type OpNode struct {
 	l1SafeSub      ethereum.Subscription // Subscription to get L1 safe blocks, a.k.a. justified data (polling)
 	l1FinalizedSub ethereum.Subscription // Subscription to get L1 safe blocks, a.k.a. justified data (polling)
 
-	l1Source  *sources.L1Client     // L1 Client to fetch data from
-	l2Driver  *driver.Driver        // L2 Engine to Sync
-	l2Source  *sources.EngineClient // L2 Execution Engine RPC bindings
-	server    *rpcServer            // RPC server hosting the rollup-node API
-	p2pNode   *p2p.NodeP2P          // P2P node functionality
-	p2pSigner p2p.Signer            // p2p gogssip application messages will be signed with this signer
-	tracer    Tracer                // tracer to get events for testing/debugging
-	runCfg    *RuntimeConfig        // runtime configurables
-
+	l1Source   *sources.L1Client     // L1 Client to fetch data from
+	l2Driver   *driver.Driver        // L2 Engine to Sync
+	l2Source   *sources.EngineClient // L2 Execution Engine RPC bindings
+	server     *rpcServer            // RPC server hosting the rollup-node API
+	p2pNode    *p2p.NodeP2P          // P2P node functionality
+	p2pSigner  p2p.Signer            // p2p gogssip application messages will be signed with this signer
+	tracer     Tracer                // tracer to get events for testing/debugging
+	runCfg     *RuntimeConfig        // runtime configurables
+	daConfig   rollup.DAConfig
 	rollupHalt string // when to halt the rollup, disabled if empty
 
 	pprofService *oppprof.Service
@@ -105,11 +106,17 @@ func New(ctx context.Context, cfg *Config, log log.Logger, snapshotLog log.Logge
 	}
 	return n, nil
 }
-
+func (n *OpNode) initDA(ctx context.Context, cfg *Config) error {
+	n.daConfig = cfg.DaConfig
+	return nil
+}
 func (n *OpNode) init(ctx context.Context, cfg *Config, snapshotLog log.Logger) error {
 	n.log.Info("Initializing rollup node", "version", n.appVersion)
 	if err := n.initTracer(ctx, cfg); err != nil {
 		return fmt.Errorf("failed to init the trace: %w", err)
+	}
+	if err := n.initDA(ctx, cfg); err != nil {
+		return err
 	}
 	if err := n.initL1(ctx, cfg); err != nil {
 		return fmt.Errorf("failed to init L1: %w", err)
@@ -324,7 +331,7 @@ func (n *OpNode) initL2(ctx context.Context, cfg *Config, snapshotLog log.Logger
 		return err
 	}
 
-	n.l2Driver = driver.NewDriver(&cfg.Driver, &cfg.Rollup, n.l2Source, n.l1Source, n.beacon, n, n, n.log, snapshotLog, n.metrics, cfg.ConfigPersistence, &cfg.Sync)
+	n.l2Driver = driver.NewDriver(&cfg.Driver, &cfg.Rollup, n.daConfig, n.l2Source, n.l1Source, n.beacon, n, n, n.log, snapshotLog, n.metrics, cfg.ConfigPersistence, &cfg.Sync)
 
 	return nil
 }

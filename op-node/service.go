@@ -78,6 +78,10 @@ func NewConfig(ctx *cli.Context, log log.Logger) (*node.Config, error) {
 		L2:     l2Endpoint,
 		Rollup: *rollupConfig,
 		Driver: *driverConfig,
+		DaConfig: rollup.DAConfig{
+			GcpProjectId:       flags.GcpProjectId.Value,
+			GcpAuthFileKeyPath: flags.GCPAuthKeyFilePath.Value,
+		},
 		RPC: node.RPCConfig{
 			ListenAddr:  ctx.String(flags.RPCListenAddr.Name),
 			ListenPort:  ctx.Int(flags.RPCListenPort.Name),

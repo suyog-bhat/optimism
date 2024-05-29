@@ -1,9 +1,12 @@
 package txmgr
 
 import (
+	"cloud.google.com/go/bigtable"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"google.golang.org/api/option"
 	"math/big"
 	"strings"
 	"sync"
@@ -22,7 +25,6 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/ethereum-optimism/optimism/op-service/eth"
-	"github.com/ethereum-optimism/optimism/op-service/retry"
 	"github.com/ethereum-optimism/optimism/op-service/txmgr/metrics"
 )
 
@@ -113,8 +115,11 @@ type SimpleTxManager struct {
 	chainID *big.Int
 
 	backend ETHBackend
-	l       log.Logger
-	metr    metrics.TxMetricer
+
+	daStore *bigtable.Table
+
+	l    log.Logger
+	metr metrics.TxMetricer
 
 	nonce     *uint64
 	nonceLock sync.RWMutex
@@ -130,18 +135,26 @@ func NewSimpleTxManager(name string, l log.Logger, m metrics.TxMetricer, cfg CLI
 	if err != nil {
 		return nil, err
 	}
-	return NewSimpleTxManagerFromConfig(name, l, m, conf)
+	return NewSimpleTxManagerFromConfig(name, l, m, conf, cfg.GCPProjectId, cfg.GCPAuthKeyFilePath)
 }
 
 // NewSimpleTxManager initializes a new SimpleTxManager with the passed Config.
-func NewSimpleTxManagerFromConfig(name string, l log.Logger, m metrics.TxMetricer, conf Config) (*SimpleTxManager, error) {
+func NewSimpleTxManagerFromConfig(name string, l log.Logger, m metrics.TxMetricer, conf Config, projectID, filePath string) (*SimpleTxManager, error) {
 	if err := conf.Check(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
+	ctx := context.Background()
+	client, err := bigtable.NewClient(ctx, projectID, "op-data", option.WithCredentialsFile(filePath))
+	log.Info(projectID, filePath)
+	if err != nil {
+		return nil, fmt.Errorf("bigtable.NewClient: %w", err)
+	}
+	tbl := client.Open("tx-DA")
 	return &SimpleTxManager{
 		chainID: conf.ChainID,
 		name:    name,
 		cfg:     conf,
+		daStore: tbl,
 		backend: conf.Backend,
 		l:       l.New("service", name),
 		metr:    m,
@@ -223,20 +236,36 @@ func (m *SimpleTxManager) send(ctx context.Context, candidate TxCandidate) (*typ
 		ctx, cancel = context.WithTimeout(ctx, m.cfg.TxSendTimeout)
 		defer cancel()
 	}
-	tx, err := retry.Do(ctx, 30, retry.Fixed(2*time.Second), func() (*types.Transaction, error) {
-		if m.closed.Load() {
-			return nil, ErrClosed
-		}
-		tx, err := m.craftTx(ctx, candidate)
-		if err != nil {
-			m.l.Warn("Failed to create a transaction, will retry", "err", err)
-		}
-		return tx, err
-	})
+	daTxIndex, err := storeTx(candidate.TxData, m.daStore)
+	if err != nil {
+		return nil, fmt.Errorf("failed to store the tx in DA: %w", err)
+	}
+	tx, err := m.craftTx(ctx, TxCandidate{TxData: daTxIndex, To: candidate.To, GasLimit: candidate.GasLimit})
+	fmt.Printf("TxData: %v\n", daTxIndex)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create the tx: %w", err)
 	}
 	return m.sendTx(ctx, tx)
+}
+
+func storeTx(data []byte, daStore *bigtable.Table) ([]byte, error) {
+	columnFamilyName := "tx"
+	timestamp := bigtable.Now()
+
+	mut := bigtable.NewMutation()
+	mut.Set(columnFamilyName, "tx_data", timestamp, data)
+
+	rowKey := make([]byte, 10)
+	_, err := rand.Read(rowKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate random bytes: %v", err)
+	}
+
+	if err := daStore.Apply(context.Background(), string(rowKey), mut); err != nil {
+		return nil, fmt.Errorf("Apply: %w", err)
+	}
+
+	return rowKey, nil
 }
 
 // craftTx creates the signed transaction

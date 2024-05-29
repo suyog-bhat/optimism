@@ -1,6 +1,7 @@
 package derive
 
 import (
+	"cloud.google.com/go/bigtable"
 	"context"
 	"errors"
 	"fmt"
@@ -28,11 +29,13 @@ type CalldataSource struct {
 	log     log.Logger
 
 	batcherAddr common.Address
+
+	daClient *bigtable.Table
 }
 
 // NewCalldataSource creates a new calldata source. It suppresses errors in fetching the L1 block if they occur.
 // If there is an error, it will attempt to fetch the result on the next call to `Next`.
-func NewCalldataSource(ctx context.Context, log log.Logger, dsCfg DataSourceConfig, fetcher L1TransactionFetcher, ref eth.L1BlockRef, batcherAddr common.Address) DataIter {
+func NewCalldataSource(ctx context.Context, log log.Logger, dsCfg DataSourceConfig, fetcher L1TransactionFetcher, ref eth.L1BlockRef, batcherAddr common.Address, daClient *bigtable.Table) DataIter {
 	_, txs, err := fetcher.InfoAndTxsByHash(ctx, ref.Hash)
 	if err != nil {
 		return &CalldataSource{
@@ -42,11 +45,12 @@ func NewCalldataSource(ctx context.Context, log log.Logger, dsCfg DataSourceConf
 			fetcher:     fetcher,
 			log:         log,
 			batcherAddr: batcherAddr,
+			daClient:    daClient,
 		}
 	}
 	return &CalldataSource{
 		open: true,
-		data: DataFromEVMTransactions(dsCfg, batcherAddr, txs, log.New("origin", ref)),
+		data: DataFromEVMTransactions(dsCfg, daClient, batcherAddr, txs, log.New("origin", ref)),
 	}
 }
 
@@ -57,7 +61,7 @@ func (ds *CalldataSource) Next(ctx context.Context) (eth.Data, error) {
 	if !ds.open {
 		if _, txs, err := ds.fetcher.InfoAndTxsByHash(ctx, ds.ref.Hash); err == nil {
 			ds.open = true
-			ds.data = DataFromEVMTransactions(ds.dsCfg, ds.batcherAddr, txs, ds.log)
+			ds.data = DataFromEVMTransactions(ds.dsCfg, ds.daClient, ds.batcherAddr, txs, ds.log)
 		} else if errors.Is(err, ethereum.NotFound) {
 			return nil, NewResetError(fmt.Errorf("failed to open calldata source: %w", err))
 		} else {
@@ -76,12 +80,36 @@ func (ds *CalldataSource) Next(ctx context.Context) (eth.Data, error) {
 // DataFromEVMTransactions filters all of the transactions and returns the calldata from transactions
 // that are sent to the batch inbox address from the batch sender address.
 // This will return an empty array if no valid transactions are found.
-func DataFromEVMTransactions(dsCfg DataSourceConfig, batcherAddr common.Address, txs types.Transactions, log log.Logger) []eth.Data {
+func DataFromEVMTransactions(dsCfg DataSourceConfig, daClient *bigtable.Table, batcherAddr common.Address, txs types.Transactions, log log.Logger) []eth.Data {
 	out := []eth.Data{}
 	for _, tx := range txs {
 		if isValidBatchTx(tx, dsCfg.l1Signer, dsCfg.batchInboxAddress, batcherAddr) {
 			out = append(out, tx.Data())
+			retrievedData, err := readTxFromDa(daClient, tx.Data())
+			if err != nil {
+				log.Error("Failed to read data from DA source")
+			}
+			out = append(out, retrievedData)
 		}
 	}
 	return out
+}
+
+func readTxFromDa(daStore *bigtable.Table, rowKey []byte) ([]byte, error) {
+	ctx := context.Background()
+	row, err := daStore.ReadRow(ctx, string(rowKey))
+	if err != nil {
+		return nil, fmt.Errorf("ReadRow: %w", err)
+	}
+	columnFamilyName := "tx"
+	columnName := "tx_data"
+
+	if col := row[columnFamilyName]; col != nil {
+		for _, item := range col {
+			if item.Column == fmt.Sprintf("%s:%s", columnFamilyName, columnName) {
+				return item.Value, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("column not found")
 }

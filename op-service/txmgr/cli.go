@@ -36,6 +36,8 @@ const (
 	TxSendTimeoutFlagName             = "txmgr.send-timeout"
 	TxNotInMempoolTimeoutFlagName     = "txmgr.not-in-mempool-timeout"
 	ReceiptQueryIntervalFlagName      = "txmgr.receipt-query-interval"
+	GCPProjectId                      = "gcp-project-id"
+	GCPAuthKeyFilePath                = "gcp-auth-key-file-path"
 )
 
 var (
@@ -178,6 +180,18 @@ func CLIFlagsWithDefaults(envPrefix string, defaults DefaultFlagValues) []cli.Fl
 			Value:   defaults.ReceiptQueryInterval,
 			EnvVars: prefixEnvVars("TXMGR_RECEIPT_QUERY_INTERVAL"),
 		},
+		&cli.StringFlag{
+			Name:    GCPProjectId,
+			Usage:   "GCP project Id",
+			Value:   "",
+			EnvVars: prefixEnvVars("GCP_PROJECT_ID"),
+		},
+		&cli.StringFlag{
+			Name:    GCPAuthKeyFilePath,
+			Usage:   "GCP credentials file path",
+			Value:   "",
+			EnvVars: prefixEnvVars("GCP_AUTH_KEY_FILE_PATH"),
+		},
 	}, opsigner.CLIFlags(envPrefix)...)
 }
 
@@ -188,6 +202,8 @@ type CLIConfig struct {
 	SequencerHDPath           string
 	L2OutputHDPath            string
 	PrivateKey                string
+	GCPProjectId              string
+	GCPAuthKeyFilePath        string
 	SignerCLIConfig           opsigner.CLIConfig
 	NumConfirmations          uint64
 	SafeAbortNonceTooLowCount uint64
@@ -247,6 +263,9 @@ func (m CLIConfig) Check() error {
 	if m.SafeAbortNonceTooLowCount == 0 {
 		return errors.New("SafeAbortNonceTooLowCount must not be 0")
 	}
+	if m.GCPProjectId == "" {
+		return errors.New("must provide GCP project Id in cli")
+	}
 	if err := m.SignerCLIConfig.Check(); err != nil {
 		return err
 	}
@@ -273,6 +292,8 @@ func ReadCLIConfig(ctx *cli.Context) CLIConfig {
 		NetworkTimeout:            ctx.Duration(NetworkTimeoutFlagName),
 		TxSendTimeout:             ctx.Duration(TxSendTimeoutFlagName),
 		TxNotInMempoolTimeout:     ctx.Duration(TxNotInMempoolTimeoutFlagName),
+		GCPProjectId:              ctx.String(GCPProjectId),
+		GCPAuthKeyFilePath:        ctx.String(GCPAuthKeyFilePath),
 	}
 }
 
@@ -397,6 +418,10 @@ type Config struct {
 	// Signer is used to sign transactions when the gas price is increased.
 	Signer opcrypto.SignerFn
 	From   common.Address
+
+	GcpProjectId       string
+	BigTableInstanceId string
+	TableName          string
 }
 
 func (m Config) Check() error {

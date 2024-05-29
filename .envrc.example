@@ -53,3 +53,5 @@ export ETHERSCAN_API_KEY=
 # Private key to use for contract deployments, you don't need to worry about
 # this for the Getting Started guide.
 export PRIVATE_KEY=
+export GOOGLE_APPLICATION_CREDENTIALS=
+export GCP_PROJECT_ID=

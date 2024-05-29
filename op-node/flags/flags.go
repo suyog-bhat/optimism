@@ -243,6 +243,18 @@ var (
 		EnvVars: prefixEnvVars("L2_BACKUP_UNSAFE_SYNC_RPC_TRUST_RPC"),
 		Hidden:  true,
 	}
+	GcpProjectId = &cli.StringFlag{
+		Name:    "gcp-project-id",
+		Usage:   "Gcp project name to store DA",
+		EnvVars: prefixEnvVars("GCP_PROJECT_ID"),
+		Hidden:  false,
+	}
+	GCPAuthKeyFilePath = &cli.StringFlag{
+		Name:    "gcp-auth-key-file-path",
+		Usage:   "auth key file for bigtable access",
+		EnvVars: prefixEnvVars("GCP_AUTH_KEY_FILE_PATH"),
+		Hidden:  false,
+	}
 )
 
 var requiredFlags = []cli.Flag{
@@ -280,6 +292,8 @@ var optionalFlags = []cli.Flag{
 	RollupHalt,
 	RollupLoadProtocolVersions,
 	L1RethDBPath,
+	GcpProjectId,
+	GCPAuthKeyFilePath,
 }
 
 var DeprecatedFlags = []cli.Flag{
