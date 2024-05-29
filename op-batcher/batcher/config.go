@@ -61,6 +61,10 @@ type CLIConfig struct {
 	// the data availability type to use for poting batches, e.g. blobs vs calldata.
 	DataAvailabilityType string
 
+	GcpProjectId        string
+	GcpBigtableInstance string
+	GcpBigTableName     string
+
 	TxMgrConfig      txmgr.CLIConfig
 	LogConfig        oplog.CLIConfig
 	MetricsConfig    opmetrics.CLIConfig
